@@ -26,7 +26,28 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
+
+def safe_write(path, text, tries=6, delay=0.12, what=""):
+    """写文件，被杀毒软件或索引器卡住就重试；真写不进去就喊出来。
+
+    静默失败比报错更坏：包没写进去，她照样醒，谁也不知道。
+    """
+    import time as _t
+    target = Path(path)
+    last = None
+    for i in range(tries):
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+            return True
+        except OSError as exc:            # 被占用 / 权限 / 磁盘忙
+            last = exc
+            _t.sleep(delay * (i + 1))
+    print("！写不进去：%s%s（%s）。这次的东西没存下来。" % (
+        target, ("（" + what + "）") if what else "", last))
+    return False
 
 def _find_home():
     r"""家在哪：先看环境变量，再看自己住在哪儿。
@@ -131,7 +152,8 @@ def load_memory():
             for line in _read(f).splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    out.append({"src": "记忆柜/%s" % rel, "text": line, "kind": "记忆"})
+                    # 文件名也是一条线索：她说得出「河边那颗石子」，名字里就有
+                    out.append({"src": "记忆柜/%s" % rel, "text": "【%s】%s" % (f.stem, line), "kind": "记忆"})
     return out
 
 
@@ -277,7 +299,9 @@ def load_pictures():
 
 # 兜底分区：放在任何地方的东西，只要没被别的分区收走，都在这儿能搜到。
 SKIP_DIRS = {"_水电", "版本快照", "__pycache__", ".git", "缓存"}
-SKIP_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
+# 脚本和配置不算"家里的话"：不然挖词会挖出「石子 → 收工.py」这种
+SCATTER_SKIP = {".py", ".bat", ".cmd", ".ps1", ".json", ".jsonl", ".ini", ".log",
+            ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
             ".pdf", ".zip", ".7z", ".rar", ".mp3", ".mp4", ".wav", ".exe",
             ".dll", ".pyc", ".bin", ".ttf", ".otf", ".woff"}
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -320,7 +344,7 @@ def load_scattered():
                             "text": "【图】%s\n%s" % (p.stem[:60], body.strip()[:1500] or "（这张图上没有认出来的字）"),
                             "where": str(p)})
                 continue
-            if ext in SKIP_EXT:
+            if ext in SCATTER_SKIP:
                 continue
             if p.stat().st_size > 400_000:      # 太大的不硬读
                 continue
@@ -365,7 +389,23 @@ def items_of(kind: str):
     return _cache[kind]
 
 
+_ITEMS_ONCE = []
+
+
 def all_items():
+    """一次运行里只读一遍目录。
+
+    每条命令是一次性的进程，所以不会读到旧数据；
+    但评测/挖词这种批量的，30 条就是 30 次重扫——缓存住就快很多。
+    """
+    if _ITEMS_ONCE:
+        return _ITEMS_ONCE[0]
+    items = _load_all_items()
+    _ITEMS_ONCE.append(items)
+    return items
+
+
+def _load_all_items():
     out = []
     for kind in REGISTRY:
         out.extend(items_of(kind))
@@ -404,8 +444,11 @@ MIN_COSINE = 0.55            # 校准过：不相关最高 0.47，相关最低 0
 # 结构留着，以后真要调，用基准量过再动。
 KIND_WEIGHT = {
     "相册": 1.0, "记忆": 1.0, "意象": 1.0, "里屋": 1.0,
-    "图": 1.0, "年表": 1.0, "书桌": 1.0, "卷宗": 1.0, "书架": 1.0, "散落": 1.0,
+    "图": 1.0, "年表": 1.0, "书桌": 1.0, "卷宗": 1.0, "书架": 1.0, "散落": 0.8,
 }
+# 关键词占多少：1.0 = 关键词说了算（语义只在没命中时兜底）
+KW_ALPHA_ONLINE = 1.0
+KW_ALPHA_OFFLINE = 0.55
 BM25_K1 = 1.5
 BM25_B = 0.75    # 网格搜出来 0.75 略好于 0.6（k1 在 0.9~2.5 之间无差别，取 1.5 防过拟合）
 _bm25_cache = {}
@@ -419,17 +462,87 @@ def _bm25_stats(all_items_list):
     docs = []
     df = {}
     for it in all_items_list:
-        cnt = {}
-        toks = grams(it["text"])
-        for tok in toks:
-            cnt[tok] = cnt.get(tok, 0) + 1
-        docs.append((cnt, sum(cnt.values())))
+        cnt, dl = doc_tokens(it)
+        docs.append((cnt, dl))
         for tok in cnt:
             df[tok] = df.get(tok, 0) + 1
     avgdl = (sum(d for _, d in docs) / len(docs)) if docs else 1.0
     _bm25_cache[key] = (docs, df, avgdl)
     return _bm25_cache[key]
 
+
+_DOC_TOK = {}
+
+
+def doc_tokens(it):
+    """某一条的词频和长度，算一次就够。"""
+    key = id(it)
+    got = _DOC_TOK.get(key)
+    if got is None:
+        cnt = Counter(grams(it["text"]))
+        got = (cnt, sum(cnt.values()))
+        _DOC_TOK[key] = got
+    return got
+
+def _tfidf_cosine(query, pool):
+    """TF-IDF 余弦：跟 BM25 互补（它按余弦归一，长文档不吃亏）。"""
+    total = len(pool)
+    docs = [doc_tokens(it)[0] for it in pool]
+    df = {}
+    for c in docs:
+        for tok in c:
+            df[tok] = df.get(tok, 0) + 1
+    qc = Counter(grams(re.sub(r"\s+", "", query)))
+    qv = {}
+    for tok, f in qc.items():
+        idf = math.log((1 + total) / (1 + df.get(tok, 0))) + 1.0
+        qv[tok] = (1 + math.log(f)) * idf
+    qn = math.sqrt(sum(x * x for x in qv.values())) or 1.0
+    qv = {t: x / qn for t, x in qv.items()}
+    out = []
+    for idx, c in enumerate(docs):
+        dot = 0.0
+        for tok, x in qv.items():
+            f = c.get(tok, 0)
+            if not f:
+                continue
+            idf = math.log((1 + total) / (1 + df.get(tok, 0))) + 1.0
+            dot += x * ((1 + math.log(f)) * idf)
+        if dot > 0:
+            norm = math.sqrt(sum(((1 + math.log(v)) *
+                                  (math.log((1 + total) / (1 + df.get(k, 0))) + 1.0)) ** 2
+                                 for k, v in c.items())) or 1.0
+            out.append((dot / norm, idx))
+    out.sort(key=lambda x: -x[0])
+    return [(s, pool[i]) for s, i in out]
+
+
+def keyword_scores(query, pool):
+    """关键词那一路：TF-IDF 余弦 + BM25，各占一半。
+
+    单用 BM25 会压长文档（b 参数），单用 TF-IDF 又对词频不敏感。
+    30 题实测：TF-IDF 87%、BM25 83%、两者混合 87%，用混合更稳。
+    """
+    tf = _tfidf_cosine(query, pool)
+    bm = bm25_scores(query, pool)
+    def norm(pairs):
+        if not pairs:
+            return {}
+        top = pairs[0][0] or 1.0
+        return {id(it): (s / top, it) for s, it in pairs[:40]}
+    a, b = norm(tf), norm(bm)
+    merged = {}
+    for key, (s, it) in a.items():
+        merged[key] = [0.5 * s, it]
+    for key, (s, it) in b.items():
+        cur = merged.get(key)
+        if cur:
+            cur[0] += 0.5 * s
+        else:
+            merged[key] = [0.5 * s, it]
+    out = [(v[0], v[1]) for v in merged.values() if v[0] > 0]
+    out.sort(key=lambda x: -x[0])
+    return out
 
 def bm25_scores(query, all_items_list):
     docs, df, avgdl = _bm25_stats(all_items_list)
@@ -565,11 +678,19 @@ def embed_available():
     if os.environ.get("FEIBAO_NO_EMBED"):
         _EMBED_OK = False
         return False
+    # 先花 1 秒问一句"你在吗"：服务器没开就立刻退，不耗 15 秒
     try:
+        with urllib.request.urlopen(OLLAMA + "/api/tags", timeout=1) as resp:
+            resp.read(256)
+    except Exception:  # noqa: BLE001
+        _EMBED_OK = False
+        return False
+    try:
+        # 模型冷启动可能十几秒，给够时间；以前给 3 秒，结果明明在线被判成离线
         body = json.dumps({"model": EMBED_MODEL, "input": ["在吗"]}).encode("utf-8")
         req = urllib.request.Request(OLLAMA + "/api/embed", data=body,
                                      headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             resp.read(2048)
         _EMBED_OK = True
     except Exception:  # noqa: BLE001
@@ -677,7 +798,28 @@ TRASH_JSON = HOME / "_水电" / "缓存" / "垃圾桶.json"
 DRAWER_TTL_DAYS = 2      # 纸条在抽屉里最多待两天（现实日期，关机也照算）
 TRASH_KEEP = 20          # 垃圾桶只留最近 20 张，多了就真没了
 TEMP_CAP = 8          # 手边最多 8 张
-LEDGER = HOME / "_水电" / "温度.json"
+# 温度账本。名字带个"找-"：有的家里另有 温度.py 也用 温度.json，格式不同，不能共用。
+LEDGER = HOME / "_水电" / "找-温度.json"
+_OLD_LEDGER = HOME / "_水电" / "温度.json"
+
+
+def _migrate_ledger():
+    """老版本把账记在 温度.json 里，搬过来（只搬长得像我们那种的）。"""
+    if LEDGER.is_file() or not _OLD_LEDGER.is_file():
+        return
+    try:
+        data = json.loads(_OLD_LEDGER.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict) and data and all(
+            isinstance(v, dict) and "hits" in v for v in list(data.values())[:5]):
+        try:
+            LEDGER.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+
+_migrate_ledger()
 
 
 def bump_temperature(src: str):
@@ -699,7 +841,7 @@ def bump_temperature(src: str):
     row["cycle"] = int(row.get("cycle", 1) or 1)
     data[name] = row
     try:
-        LEDGER.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        safe_write(LEDGER, json.dumps(data, ensure_ascii=False, indent=2), what="温度")
     except OSError:
         pass
 PIN_CAP = 2           # 钉住的最多 2 张
@@ -716,7 +858,7 @@ def _temp_load():
 
 def _temp_save(rows):
     try:
-        TEMP_JSON.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
+        safe_write(TEMP_JSON, json.dumps(rows, ensure_ascii=False, indent=1), what="手边")
         lines = ["临时记忆（手边一张纸）", "（看完就收，不收会一直放在这儿；最多留 8 条）", ""]
         for i, row in enumerate(rows, 1):
             lines.append("%d. [%s] %s" % (i, row.get("at", ""), row.get("title", "")))
@@ -786,6 +928,7 @@ SEATS = {
 }
 ORDER = ("阿草", "老周", "小满")     # 换成你自己家里的几个人
 
+
 COUNCIL_KEEP = 240        # 评议.txt 最多留 240 行，再老的就并到「旧」那份
 
 
@@ -816,7 +959,7 @@ def _council_load():
 
 def _council_save(data):
     try:
-        COUNCIL_JSON.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        safe_write(COUNCIL_JSON, json.dumps(data, ensure_ascii=False, indent=1), what="评议")
     except OSError:
         pass
 
@@ -925,7 +1068,7 @@ def drawer_cleanup():
     if expired:
         _trash_add(expired)
         try:
-            DRAWER_JSON.write_text(json.dumps(kept, ensure_ascii=False, indent=1), encoding="utf-8")
+            safe_write(DRAWER_JSON, json.dumps(kept, ensure_ascii=False, indent=1), what="抽屉")
         except OSError:
             pass
     return {"kept": len(kept), "expired": len(expired), "off_days": off_days}
@@ -946,7 +1089,7 @@ def _drawer_save(rows):
     for row in rows:
         row.setdefault("在抽屉", today)
     try:
-        DRAWER_JSON.write_text(json.dumps(rows[-24:], ensure_ascii=False, indent=1), encoding="utf-8")
+        safe_write(DRAWER_JSON, json.dumps(rows[-24:], ensure_ascii=False, indent=1), what="抽屉")
     except OSError:
         pass
 
@@ -1072,29 +1215,31 @@ def search_ranked(query, kind="", top=3):
     pool = items_of(kind) if kind else allit
     df = build_df(allit)
     total = len(allit)
-    kw = bm25_scores(query, pool)
-    mode = ""
-    if embed_available():
+    kw = keyword_scores(query, pool)
+    semi = []
+    if kw:
+        # 关键词已经命中了，就不去碰模型：省一次冷启动（实测能省 14 秒）
+        # 语义只在"一条都没命中"时才帮忙，这也是 30 题量出来的结论
+        mode = "关键词"
+    elif embed_available():
+        df = build_df(allit)
         vecs = warm_vectors(pool)
         semi = semantic_rank(query, pool, vecs, df, total, top=8)
-        mode = "含语义"
+        mode = "含语义（兜底）"
     else:
-        expanded, did = expand_query(query)
-        if did:
-            words = expanded[len(query):].split()
-            kw2 = []
-            for it in pool:
-                hits = sum(1 for w in words if w in it["text"])
-                if hits >= 2:
-                    kw2.append((hits, it))
-            kw2.sort(key=lambda x: -x[0])
-            if kw2:
-                kw = kw2 + kw
-        semi = fuzzy_rank(expanded if did else query, pool, top=8)
-        mode = "离线：扩展词 + 字符相似"
-    if not kw and semi:
-        semi = [(s, it) for s, it in semi if s >= 0.62]
-    alpha = 0.3 if mode == "含语义" else 0.55
+        expanded, _did = expand_query(query)
+        words = expanded[len(query):].split() if _did else []
+        kw2 = []
+        for it in pool:
+            hits = sum(1 for w in words if w in it["text"])
+            if hits >= 2:
+                kw2.append((hits, it))
+        kw2.sort(key=lambda x: -x[0])
+        if kw2:
+            kw = kw2
+        semi = fuzzy_rank(expanded if _did else query, pool, top=8)
+        mode = "离线（模糊兜底）"
+    alpha = 1.0
     fused, by_id = {}, {}
     kw_top = kw[0][0] if kw else 0.0
     for s, it in kw[:20]:
@@ -1109,11 +1254,221 @@ def search_ranked(query, kind="", top=3):
     hits = [by_id[k] for k, _ in order[:top] if k in by_id]
     return hits, mode, time.time() - t0
 
+# ---------------------------------------------------------------- 挖词
+WORD_BAD = set("的了是在和也就都很我你他她它把被给让对从到又还但而及与或个这那有没不一")
+WORD_STOP = set("""什么 自己 然后 今天 时候 觉得 起来 出来 一下 一样 这样 那样 因为 所以 但是 现在 已经 还是 就是 没有 一个 我们 他们 你们 这个 那个 里面 外面 上面 下面 前面 后面 上来 下去 之前 之后 东西 事情 两遍 一边 有点 一点 不是 不能 可以 可能 应该 知道 看见 看到 听到 说话""".split())
+WORD_PUNCT = set("，。、；：""''（）《》…—！？·　,.!?;:()[]{}<>/\\|~`@#$%^&*+=-_”")
+CAND_JSON = HOME / "_水电" / "词表-候选.json"
+
+
+def _anchors():
+    """锚点：词表里已有的 + 记忆里写过的「标签」。
+
+    标签是写记忆时顺手打的（标签：万敌, 耐热），比手写词表省事得多。
+    """
+    seen = []
+    for key in _load_expand():
+        if key not in seen:
+            seen.append(key)
+    mem = HOME / "记忆柜"
+    if mem.is_dir():
+        for p in mem.rglob("*.md"):
+            try:
+                for line in p.read_text(encoding="utf-8", errors="replace").splitlines()[:8]:
+                    if not line.strip().startswith("标签"):
+                        continue
+                    body = line.split("：", 1)[-1].split(":", 1)[-1]
+                    for tag in re.split(r"[,，、;；\s]+", body):
+                        tag = tag.strip()
+                        if 2 <= len(tag) <= 6 and tag not in seen:
+                            seen.append(tag)
+            except OSError:
+                continue
+    return seen
+
+def _merge_pieces(rows, known):
+    """相邻双字拼回词，但只拼"原文里真出现过"的三字。
+
+    没这道校验会拼出「张三看」「海道旅」这种假词。
+    """
+    out = []
+    used = set()
+    for i, (w, c, d) in enumerate(rows):
+        if i in used:
+            continue
+        best = None
+        for j, (w2, c2, d2) in enumerate(rows):
+            if j == i or j in used:
+                continue
+            merged = w + w2[1:]
+            if w[-1] != w2[0] or merged not in known:
+                continue
+            score = min(c, c2)
+            if best is None or score > best[0]:
+                best = (score, j, merged, c2, d2)
+        if best:
+            used.add(i)
+            used.add(best[1])
+            out.append((best[2], max(c, best[3]), max(d, best[4])))
+        else:
+            used.add(i)
+            out.append((w, c, d))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+def mine_words(top_per_anchor=8, min_hits=3, max_docs=40):
+    """从卷宗里挖"跟某个名字总一起出现的东西"。
+
+    只写候选，不动词表。同现份数当证据给人看。
+    """
+    items = all_items()
+    df = Counter()
+    for it in items:
+        for g in set(grams(it["text"])):
+            if len(g) == 2 and not any(c in WORD_PUNCT for c in g):
+                df[g] += 1
+    limit = max(20, len(items) // 4)
+    # 原文里出现过至少 3 次的 3 字串，用来校验拼出来的词是真的
+    tri = Counter()
+    for it in items:
+        s = re.sub(r"\s+", "", it["text"])
+        for k in range(len(s) - 2):
+            piece = s[k:k + 3]
+            if any(ch in WORD_PUNCT for ch in piece):
+                continue
+            tri[piece] += 1
+    known = {w for w, c in tri.items() if c >= 5}      # 拼出来的词，原话里至少五回
+    out = {}
+    for anchor in _anchors():
+        near = Counter()
+        docs = Counter()
+        for it in items:
+            text = it["text"]
+            if anchor not in text or "没有认出来的字" in text:
+                continue
+            for m in re.finditer(re.escape(anchor), text):
+                lo = max(0, m.start() - 30)
+                hi = min(len(text), m.end() + 30)
+                seen = set()
+                for g in grams(text[lo:hi]):
+                    if len(g) != 2 or any(c in WORD_PUNCT for c in g):
+                        continue
+                    if any(ch in WORD_BAD for ch in g):
+                        continue
+                    if re.search(r"[A-Za-z0-9]", g):          # 代码和版本号，不是话
+                        continue
+                    if anchor in g or g in seen or df[g] > limit or g in WORD_STOP:
+                        continue
+                    seen.add(g)
+                    near[g] += 1
+                    docs[g] += 1
+        picked = [(w, c, docs[w]) for w, c in near.most_common(40)
+                  if c >= min_hits and docs[w] <= max_docs]
+        picked = _merge_pieces(picked, known)
+        # 「张三看」这种：拼出来的词以别的名字开头，是假词
+        # 拼出来的词尾是动词的，基本是「张三看」「人机改」这类假词
+        bad_tail = set("看说走想来去笑问答坐站拿放吃改扑飞落开有是把被给")
+        picked = [(w, c, d) for w, c, d in picked if not (len(w) > 2 and w[-1] in bad_tail)]
+        others = [a for a in _anchors() if a != anchor]
+        picked = [(w, c, d) for w, c, d in picked
+                  if anchor not in w and not (len(w) > 2 and any(w.startswith(o) for o in others))]
+        if picked:
+            out[anchor] = [{"词": w, "同现": c, "份数": d} for w, c, d in picked[:top_per_anchor]]
+    return out
+
+
+def cmd_mine():
+    found = mine_words()
+    if not found:
+        print("没挖到：要么家里东西太少（同现不到 3 次），要么词表还是空的。")
+        return 0
+    try:
+        CAND_JSON.write_text(json.dumps(found, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError as exc:
+        print("写不进候选文件：%s" % exc)
+        return 1
+    total = sum(len(v) for v in found.values())
+    print("挖到 %d 组、共 %d 个候选词（写在 %s）" % (len(found), total, CAND_JSON.name))
+    for anchor, rows in list(found.items())[:8]:
+        words = "、".join("%s(%d)" % (r["词"], r["同现"]) for r in rows[:6])
+        print("  %-6s → %s" % (anchor, words))
+    print()
+    print("（这些只是候选。想收进去：改 _水电\\词表.json 自己加，或者用「收词」全收）")
+    return 0
+
+
+def cmd_accept_words(argv=None):
+    """把候选并进词表。
+
+    不带参数：先看有哪些组，不动。
+    带组名（可以几个）：只收这几组，其余留在候选里。
+        python 找.py 收词 围裙 画
+    """
+    if not CAND_JSON.is_file():
+        print("没有候选文件。先跑「挖词」。")
+        return 0
+    try:
+        cand = json.loads(CAND_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print("候选文件坏了，读不出来。")
+        return 1
+    args = [a for a in (argv or []) if a]
+    if not args:
+        print("候选里有 %d 组：" % len(cand))
+        for anchor, rows in cand.items():
+            words = "、".join(r["词"] if isinstance(r, dict) else str(r) for r in rows[:6])
+            print("  %-6s → %s" % (anchor, words))
+        print()
+        print("收哪组就写哪组：python 找.py 收词 围裙 画")
+        return 0
+
+    path = HOME / "_水电" / "词表.json"
+    try:
+        table = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    except (OSError, ValueError):
+        table = {}
+    added = 0
+    taken = []
+    for anchor in args:
+        rows = cand.get(anchor)
+        if not rows:
+            print("候选里没有「%s」这组。" % anchor)
+            continue
+        cur = list(table.get(anchor, []))
+        for row in rows:
+            word = row.get("词") if isinstance(row, dict) else str(row)
+            if word and word not in cur:
+                cur.append(word)
+                added += 1
+        table[anchor] = cur
+        taken.append(anchor)
+    if not taken:
+        return 0
+    for anchor in taken:
+        cand.pop(anchor, None)
+    try:
+        path.write_text(json.dumps(table, ensure_ascii=False, indent=1), encoding="utf-8")
+        if cand:
+            CAND_JSON.write_text(json.dumps(cand, ensure_ascii=False, indent=1), encoding="utf-8")
+        else:
+            CAND_JSON.unlink()
+    except OSError as exc:
+        print("写不进词表：%s" % exc)
+        return 1
+    print("收了 %d 个词（%s）。词表现在 %d 组。" % (added, "、".join(taken), len(table)))
+    print("（下次检索生效；不想要就改 词表.json 删掉）")
+    return 0
+
 def main(argv):
     if not argv:
         print(__doc__)
         return 0
     cmd = argv[0]
+    if cmd in ("挖词", "挖"):
+        return cmd_mine()
+    if cmd in ("收词", "收候选"):
+        return cmd_accept_words(argv[1:])
+
     if cmd in ("清缓存", "剪缓存"):
         rebuild = bool(len(argv) > 1 and argv[1] in ("全部", "重建", "all"))
         res = prune_vectors(rebuild=rebuild)
@@ -1227,7 +1582,7 @@ def main(argv):
             return 0
         _trash_add(rows)
         try:
-            DRAWER_JSON.write_text("[]", encoding="utf-8")
+            safe_write(DRAWER_JSON, "[]", what="抽屉")
         except OSError:
             pass
         print("倒了 %d 张进垃圾桶（记忆本身还在文件夹里）。" % len(rows))

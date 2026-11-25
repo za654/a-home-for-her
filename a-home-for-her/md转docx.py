@@ -127,9 +127,9 @@ def md_to_docx(src, dst, title=None):
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Pt(18)
             txt = line.lstrip("> ").strip()
-            r = p.add_run(txt)
-            r.italic = True
-            set_cn(r)
+            add_runs(p, txt)      # 引用里也可能有 **加粗** 和 `代码`
+            for r in p.runs:
+                r.italic = True
             i += 1
             continue
 
